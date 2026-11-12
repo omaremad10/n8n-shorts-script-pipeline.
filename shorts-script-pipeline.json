@@ -1,0 +1,259 @@
+{
+  "name": "Shorts script pipeline",
+  "nodes": [
+    {
+      "parameters": {
+        "updates": [
+          "message"
+        ],
+        "additionalFields": {}
+      },
+      "id": "2e95666f-b1c9-5eb4-922d-a2035ddba650",
+      "name": "Telegram Trigger",
+      "type": "n8n-nodes-base.telegramTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        0,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Pull the topic and chat id out of the Telegram message.\nconst msg = $input.first().json.message || {};\nconst chatId = msg.chat && msg.chat.id;\nconst topic = (msg.text || '').replace(/^\\/\\w+(@\\w+)?\\s*/, '').trim();\n\nif (!chatId || !topic) {\n  // Nothing usable (sticker, photo, bare /start): stop this run quietly.\n  return [];\n}\n\nreturn [{ json: { chatId, topic } }];\n"
+      },
+      "id": "2dd0eb51-9102-5281-b49b-ce5d09b15c66",
+      "name": "Extract topic",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        220,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.tavily.com/search",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ query: $json.topic, topic: 'news', time_range: 'week', max_results: 5 }) }}",
+        "options": {}
+      },
+      "id": "fcbd74e9-8758-5583-92ac-a046c5c4caed",
+      "name": "Search trends (Tavily)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        440,
+        0
+      ],
+      "notes": "Header Auth credential: Authorization = Bearer tvly-...",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// Turn Tavily results into a prompt for the script writer.\nconst { chatId, topic } = $('Extract topic').first().json;\nconst results = ($input.first().json.results || []).slice(0, 5);\n\nconst sources = results.map((r) => ({ title: r.title, url: r.url }));\nconst research = results.length\n  ? results\n      .map((r, i) => `${i + 1}. ${r.title}\\n${(r.content || '').slice(0, 500)}`)\n      .join('\\n\\n')\n  : 'No recent coverage found. Write from general knowledge and do not invent news.';\n\nconst system = [\n  'You write scripts for short vertical videos (TikTok, YouTube Shorts, Instagram Reels).',\n  'Use only facts supported by the research notes. Do not invent statistics, quotes or events.',\n  'Reply with a single JSON object and nothing else, with these keys:',\n  '\"title\" (max 60 characters),',\n  '\"hook\" (one spoken sentence for the first 3 seconds),',\n  '\"script\" (the full voiceover including the hook, 90 to 130 words, plain spoken text, no stage directions, no emojis),',\n  '\"caption\" (one or two sentences for the post),',\n  '\"hashtags\" (array of 5 strings, each starting with #).',\n].join(' ');\n\nconst user = `Topic: ${topic}\\n\\nResearch notes from the last week:\\n\\n${research}`;\n\nreturn [\n  {\n    json: {\n      chatId,\n      topic,\n      sources,\n      messages: [\n        { role: 'system', content: system },\n        { role: 'user', content: user },\n      ],\n    },\n  },\n];\n"
+      },
+      "id": "23898317-702d-54c2-ad19-1eb776292630",
+      "name": "Build prompt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        660,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.groq.com/openai/v1/chat/completions",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ model: 'llama-3.3-70b-versatile', temperature: 0.7, response_format: { type: 'json_object' }, messages: $json.messages }) }}",
+        "options": {}
+      },
+      "id": "4ad641f3-cf06-5361-a3f9-ce57f453dc0f",
+      "name": "Write script (Groq)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        880,
+        0
+      ],
+      "notes": "Header Auth credential: Authorization = Bearer gsk_...",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// Read the model's JSON reply and build the Telegram message.\nconst { chatId, topic, sources } = $('Build prompt').first().json;\nconst raw = $input.first().json.choices?.[0]?.message?.content || '';\n\nlet data;\ntry {\n  data = JSON.parse(raw);\n} catch (err) {\n  // The model ignored the JSON instruction: fall back to using its text as the script.\n  data = { title: topic, hook: '', script: raw, caption: '', hashtags: [] };\n}\n\nconst script = String(data.script || '').trim();\nif (!script) {\n  throw new Error('The model returned an empty script.');\n}\n\nconst esc = (s) =>\n  String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');\nconst hashtags = Array.isArray(data.hashtags) ? data.hashtags.join(' ') : '';\n\nconst parts = [\n  `<b>${esc(data.title || topic)}</b>`,\n  data.hook ? `<b>Hook:</b> ${esc(data.hook)}` : '',\n  `<b>Script:</b>\\n${esc(script)}`,\n  data.caption ? `<b>Caption:</b> ${esc(data.caption)}` : '',\n  hashtags ? esc(hashtags) : '',\n  sources.length\n    ? '<b>Sources:</b>\\n' + sources.map((s) => `- ${esc(s.title)}\\n  ${esc(s.url)}`).join('\\n')\n    : '',\n].filter(Boolean);\n\n// Telegram rejects messages over 4096 characters.\nconst message = parts.join('\\n\\n').slice(0, 4000);\n\nreturn [{ json: { chatId, topic, title: data.title || topic, script, message } }];\n"
+      },
+      "id": "e44c5afb-a690-5642-9f9f-f5b544c00507",
+      "name": "Parse script",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1100,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $json.chatId }}",
+        "text": "={{ $json.message }}",
+        "additionalFields": {
+          "parse_mode": "HTML",
+          "appendAttribution": false,
+          "disable_web_page_preview": true
+        }
+      },
+      "id": "cfd9c8eb-fb6f-5078-b6e1-0662af1359ff",
+      "name": "Send script",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1320,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.murf.ai/v1/speech/generate",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ text: $('Parse script').first().json.script, voiceId: 'en-US-natalie', format: 'MP3' }) }}",
+        "options": {}
+      },
+      "id": "688377c9-7724-59d8-a0c2-7d53358812d7",
+      "name": "Generate voiceover (Murf)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1540,
+        0
+      ],
+      "notes": "Header Auth credential: api-key = your Murf key",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "operation": "sendAudio",
+        "chatId": "={{ $('Parse script').first().json.chatId }}",
+        "file": "={{ $json.audioFile }}",
+        "additionalFields": {
+          "title": "={{ $('Parse script').first().json.title }}"
+        }
+      },
+      "id": "9b04dcb2-96ae-5246-9793-1f1049d4bef4",
+      "name": "Send voiceover",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1760,
+        0
+      ]
+    }
+  ],
+  "connections": {
+    "Telegram Trigger": {
+      "main": [
+        [
+          {
+            "node": "Extract topic",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract topic": {
+      "main": [
+        [
+          {
+            "node": "Search trends (Tavily)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Search trends (Tavily)": {
+      "main": [
+        [
+          {
+            "node": "Build prompt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build prompt": {
+      "main": [
+        [
+          {
+            "node": "Write script (Groq)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Write script (Groq)": {
+      "main": [
+        [
+          {
+            "node": "Parse script",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse script": {
+      "main": [
+        [
+          {
+            "node": "Send script",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send script": {
+      "main": [
+        [
+          {
+            "node": "Generate voiceover (Murf)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Generate voiceover (Murf)": {
+      "main": [
+        [
+          {
+            "node": "Send voiceover",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "tags": []
+}
